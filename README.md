@@ -1,11 +1,15 @@
 <p align="center">
-  <img src="AppIcon.png" width="128" alt="MenuTimer icon">
+  <img src="assets/AppIcon.png" width="128" alt="MenuTimer icon">
 </p>
 
 <h1 align="center">MenuTimer</h1>
 
 <p align="center">
   A small multi-timer that lives in your macOS menu bar.
+</p>
+
+<p align="center">
+  <img src="assets/menubar.png" width="420" alt="MenuTimer screenshot">
 </p>
 
 <!-- Add a screenshot: drag an image into this file on GitHub, or use ![MenuTimer](screenshot.png) -->
