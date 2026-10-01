@@ -16,6 +16,7 @@
 
 <p align="center">
   <img src="assets/menubar.png" width="340" alt="MenuTimer panel with two timers">
+    <img src="assets/active.png" width="340" alt="MenuTimer panel with two timers, one active">
 </p>
 
 ## Features
