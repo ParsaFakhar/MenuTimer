@@ -1,29 +1,32 @@
-<p align="center">
-  <img src="assets/AppIcon.png" width="128" alt="MenuTimer icon">
-</p>
-
-<h1 align="center">MenuTimer</h1>
-
-<p align="center">
-  A small multi-timer that lives in your macOS menu bar.
-</p>
+<h1 align="center">
+  <img src="assets/AppIcon.png" width="56" align="absmiddle" alt="">
+  MenuTimer
+</h1>
 
 <p align="center">
-  <img src="assets/menubar.png" width="420" alt="MenuTimer screenshot">
+  A small multi-timer that lives in your macOS menu bar.<br>
+  Run several timers at once, add time on the fly, get an alarm when one ends.
 </p>
 
-<!-- Add a screenshot: drag an image into this file on GitHub, or use ![MenuTimer](screenshot.png) -->
+<p align="center">
+  <a href="https://github.com/ParsaFakhar/MenuTimer/releases/latest"><img src="https://img.shields.io/github/v/release/ParsaFakhar/MenuTimer?label=download&style=for-the-badge&color=2ea44f" alt="Download latest release"></a>
+  <img src="https://img.shields.io/badge/macOS-14%2B-blue?style=for-the-badge&logo=apple&logoColor=white" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/SwiftUI-native-orange?style=for-the-badge&logo=swift&logoColor=white" alt="SwiftUI">
+</p>
+
+<p align="center">
+  <img src="assets/menubar.png" width="340" alt="MenuTimer panel with two timers">
+</p>
 
 ## Features
 
-- **Multiple timers at once**, each with its own name and length
-- **Live countdown in the menu bar** showing the timer that ends soonest
-- **"Ends at" time** on every running timer
-- **Quick adjust** with `+ 1m` and `+ 5m` buttons
-- **Alarm sound** when a timer finishes, with the menu bar switching to a bell and "Done"
-- **Saved timers**: your list is remembered between launches
-- **Native SwiftUI**, a single source file with no dependencies
-- **Simple Format** 3:5:32 --> 3 Hour and 5 Minute and 32 Seconds
+- **Multiple timers**, running side by side
+- **Live countdown** in the menu bar for the timer that ends soonest
+- **Quick adjust** with `+ 1m` / `+ 5m`, even while a timer is running
+- **Alarm** with a bell and "Done" in the menu bar when time is up
+- **Fast entry**: type `25`, `1:30` or `3:05:32` (h:mm:ss)
+- **Remembers your timers** between launches
+- **Native SwiftUI**: one source file, no dependencies
 
 ## Requirements
 
