@@ -13,6 +13,7 @@ A small multi-timer that lives in your macOS menu bar. Run several timers at onc
 - **Alarm sound** when a timer finishes, with the menu bar switching to a bell and "Done"
 - **Saved timers**: your list is remembered between launches
 - **Native SwiftUI**, a single source file with no dependencies
+- **Simple Format** 3:5:32 --> 3 Hour and 5 Minute and 32 Seconds
 
 ## Requirements
 
