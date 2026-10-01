@@ -1,7 +1,3 @@
-# MenuTimer
-
-A small multi-timer that lives in your macOS menu bar. Run several timers at once, add time on the fly, and get an alarm when one finishes. No Dock icon, no windows, and almost no CPU use while idle.
-
 <p align="center">
   <img src="AppIcon.png" width="128" alt="MenuTimer icon">
 </p>
