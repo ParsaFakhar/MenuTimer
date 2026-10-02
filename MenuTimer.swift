@@ -1,5 +1,16 @@
 // MenuTimer.swift — a small multi-timer that lives in the macOS menu bar.
 // Build with ./build.sh (needs Xcode Command Line Tools, macOS 14+).
+//
+// PERF NOTES (what changed vs. the original):
+//  1. The old 0.5 s ticker called objectWillChange.send() on the whole store, so every
+//     view (header, every row, text fields, backgrounds) was re-evaluated twice a second,
+//     and half of those passes produced identical text. Now the store only publishes when
+//     something really changes (start/pause/finish/...), and a tiny `Heartbeat` object
+//     drives ONLY the countdown texts and the menu bar label.
+//  2. The ticker is now a one-shot timer aimed just past the next whole-second boundary of
+//     the soonest-ending timer (1 wake-up per second, never 2, always in step with the display).
+//  3. tick() assigns `runtime` once (and only if a timer finished) instead of publishing in a loop.
+//  4. "Ends at" uses a cached DateFormatter instead of building a format style per render.
 
 import SwiftUI
 import AppKit
@@ -23,6 +34,14 @@ private let menuBarImage: NSImage? = {
     img.isTemplate = true
     img.size = NSSize(width: 18, height: 18)
     return img
+}()
+
+/// Created once, reused for every "Ends at ..." label.
+private let endTimeFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateStyle = .none
+    f.timeStyle = .short
+    return f
 }()
 
 func formatTime(_ t: TimeInterval) -> String {
@@ -69,6 +88,14 @@ struct Runtime {
     var endDate: Date?
 }
 
+// MARK: - Heartbeat (the only thing that changes once per second)
+
+/// Views that show a live countdown observe this; everything else observes the store only.
+final class Heartbeat: ObservableObject {
+    @Published private(set) var now = Date()
+    func beat() { now = Date() }
+}
+
 // MARK: - Store
 
 final class TimerStore: ObservableObject {
@@ -77,6 +104,8 @@ final class TimerStore: ObservableObject {
     // "add timer" form fields live here (instead of @State) so no SwiftUI macro plugin is needed
     @Published var draftName = ""
     @Published var draftLength = ""
+
+    let heartbeat = Heartbeat()
 
     private var ticker: Timer?
     private var alarmTimer: Timer?
@@ -114,7 +143,7 @@ final class TimerStore: ObservableObject {
     /// "11:47 AM" while a timer is running, otherwise nil.
     func endsAt(_ id: UUID) -> String? {
         guard let r = runtime[id], r.state == .running, let end = r.endDate else { return nil }
-        return end.formatted(date: .omitted, time: .shortened)
+        return endTimeFormatter.string(from: end)
     }
 
     var anyFinished: Bool { runtime.values.contains { $0.state == .finished } }
@@ -179,6 +208,7 @@ final class TimerStore: ObservableObject {
         case .running:
             r.endDate = (r.endDate ?? Date()).addingTimeInterval(extra)
             runtime[id] = r
+            updateTicker()   // end date moved -> re-aim the next wake-up
         case .paused:
             r.remaining += extra
             runtime[id] = r
@@ -213,32 +243,57 @@ final class TimerStore: ObservableObject {
         silenceIfNothingFinished()
     }
 
-    // MARK: Ticking (only runs while a timer is running, so it idles at ~0% CPU)
+    // MARK: Ticking
+    // One-shot timer, re-armed after every tick. It wakes up just after the next whole-second
+    // boundary of the soonest-ending timer (that's exactly when the displayed value changes),
+    // and never later than the moment any running timer ends. Nothing is scheduled while no
+    // timer is running, so the app idles at ~0% CPU.
 
     private func updateTicker() {
-        if anyRunning {
-            guard ticker == nil else { return }
-            let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
-            RunLoop.main.add(t, forMode: .common)
-            ticker = t
+        ticker?.invalidate()
+        ticker = nil
+
+        let now = Date()
+        let ends = runtime.values.compactMap { $0.state == .running ? $0.endDate : nil }
+        guard let soonest = ends.min() else { return }
+
+        let rem = soonest.timeIntervalSince(now)
+        var delay: TimeInterval
+        if rem <= 0 {
+            delay = 0.01
         } else {
-            ticker?.invalidate()
-            ticker = nil
+            delay = rem - rem.rounded(.down)      // time until the next integer second boundary
+            if delay < 0.05 { delay += 1 }
+            delay += 0.01                          // land just past it so ceil() has flipped
         }
+        // make sure any other timer ending sooner still fires its alarm on time
+        for end in ends {
+            let d = end.timeIntervalSince(now)
+            if d > 0 && d + 0.01 < delay { delay = d + 0.01 }
+        }
+
+        let t = Timer(timeInterval: delay, repeats: false) { [weak self] _ in self?.tick() }
+        t.tolerance = 0.02   // may fire slightly late, never early
+        RunLoop.main.add(t, forMode: .common)
+        ticker = t
     }
 
     private func tick() {
         let now = Date()
+        var updated = runtime
         var justFinished = false
         for (id, r) in runtime where r.state == .running {
             if let end = r.endDate, end <= now {
-                runtime[id] = Runtime(state: .finished, remaining: 0, endDate: nil)
+                updated[id] = Runtime(state: .finished, remaining: 0, endDate: nil)
                 justFinished = true
             }
         }
-        if justFinished { startAlarm() }
+        if justFinished {
+            runtime = updated      // single publish, only when something actually changed
+            startAlarm()
+        }
+        heartbeat.beat()           // refresh countdown texts + menu bar label only
         updateTicker()
-        objectWillChange.send()   // refresh the countdown display
     }
 
     // MARK: Alarm
@@ -260,6 +315,7 @@ final class TimerStore: ObservableObject {
                 self.playSound()
             }
         }
+        t.tolerance = 0.25
         RunLoop.main.add(t, forMode: .common)
         alarmTimer = t
     }
@@ -286,6 +342,7 @@ final class TimerStore: ObservableObject {
 
 struct MenuLabel: View {
     @ObservedObject var store: TimerStore
+    @ObservedObject var heartbeat: Heartbeat   // re-render once per second for the countdown text
 
     var body: some View {
         HStack(spacing: 4) {
@@ -303,8 +360,25 @@ struct MenuLabel: View {
     }
 }
 
+/// The big countdown. This is the ONLY part of a row that redraws every second.
+struct CountdownText: View {
+    let store: TimerStore                       // plain reference: not observed on purpose
+    @ObservedObject var heartbeat: Heartbeat    // observed: triggers the per-second redraw
+    let id: UUID
+    let color: Color
+
+    var body: some View {
+        Text(store.state(of: id) == .finished ? "00:00" : formatTime(store.remaining(of: id)))
+            .font(.system(size: 34, weight: .semibold, design: .monospaced))
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .minimumScaleFactor(0.6)
+    }
+}
+
 struct TimerRow: View {
     @ObservedObject var store: TimerStore
+    let heartbeat: Heartbeat                    // passed down, NOT observed here
     let item: TimerItem
 
     private var state: RunState { store.state(of: item.id) }
@@ -348,11 +422,7 @@ struct TimerRow: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 8)
-                Text(state == .finished ? "00:00" : formatTime(store.remaining(of: item.id)))
-                    .font(.system(size: 34, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(timeColor)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.6)
+                CountdownText(store: store, heartbeat: heartbeat, id: item.id, color: timeColor)
             }
             .contentShape(Rectangle())
             .onTapGesture { store.toggle(item.id) }
@@ -432,7 +502,7 @@ struct ContentView: View {
             }
 
             ForEach(store.items) { item in
-                TimerRow(store: store, item: item)
+                TimerRow(store: store, heartbeat: store.heartbeat, item: item)
             }
 
             // Add a new timer
@@ -492,7 +562,7 @@ struct MenuTimerApp: App {
         MenuBarExtra {
             ContentView(store: store)
         } label: {
-            MenuLabel(store: store)
+            MenuLabel(store: store, heartbeat: store.heartbeat)
         }
         .menuBarExtraStyle(.window)
     }
