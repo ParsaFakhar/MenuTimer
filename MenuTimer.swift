@@ -1,16 +1,19 @@
 // MenuTimer.swift — a small multi-timer that lives in the macOS menu bar.
 // Build with ./build.sh (needs Xcode Command Line Tools, macOS 14+).
 //
-// PERF NOTES (what changed vs. the original):
-//  1. The old 0.5 s ticker called objectWillChange.send() on the whole store, so every
-//     view (header, every row, text fields, backgrounds) was re-evaluated twice a second,
-//     and half of those passes produced identical text. Now the store only publishes when
-//     something really changes (start/pause/finish/...), and a tiny `Heartbeat` object
-//     drives ONLY the countdown texts and the menu bar label.
-//  2. The ticker is now a one-shot timer aimed just past the next whole-second boundary of
-//     the soonest-ending timer (1 wake-up per second, never 2, always in step with the display).
-//  3. tick() assigns `runtime` once (and only if a timer finished) instead of publishing in a loop.
-//  4. "Ends at" uses a cached DateFormatter instead of building a format style per render.
+// PERF DESIGN (unchanged from 1.0.1):
+//  - The store only publishes when something really changes (start/pause/finish/edit...).
+//  - A tiny `Heartbeat` object drives ONLY the countdown texts and the menu bar label.
+//  - One one-shot timer, aimed just past the next whole-second boundary (1 wake-up/second,
+//    nothing scheduled when no timer is running).
+//
+// NEW IN 1.1:
+//  - New timers: click the 00 : 00 : 00 fields (hours / minutes / seconds) and type.
+//  - -5m / -1m buttons next to +1m / +5m (never drops below 00:00:01).
+//  - Click the big countdown to set the remaining time (e.g. 1:43:33 -> 43:33).
+//    Click the name/status area (or the play button) to start/pause.
+//  - The "add timer" fields and the editor fields live in small views with their own state, so typing
+//    redraws only that one view, not the whole panel.
 
 import SwiftUI
 import AppKit
@@ -21,6 +24,7 @@ private let alarmSoundName = "Glass"   // try: Frog, Hero, Ping, Submarine, Funk
 private let alarmRepeatSeconds = 2.5   // gap between alarm repeats
 private let alarmMaxRepeats = 12       // alarm silences itself after ~30 s
 private let panelTitle = "timers"      // header text in the dropdown
+private let panelWidth: CGFloat = 400  // dropdown width (the 4 +/- buttons + 3 controls need ~330 pt inside)
 private let menuBarSymbol = "timer"    // fallback icon if MenuBarIcon.png is missing (any SF Symbol name)
 
 private let runningGreen = Color(red: 0.36, green: 0.68, blue: 0.36)
@@ -54,22 +58,35 @@ func formatTime(_ t: TimeInterval) -> String {
         : String(format: "%02d:%02d", m, sec)
 }
 
-/// Accepts "25" (minutes), "1:30" (min:sec) or "1:00:00" (h:min:sec).
-func parseDuration(_ text: String) -> Int? {
-    let parts = text
-        .trimmingCharacters(in: .whitespaces)
-        .split(separator: ":")
-        .map { Int($0.trimmingCharacters(in: .whitespaces)) }
-    guard !parts.isEmpty, !parts.contains(where: { $0 == nil }) else { return nil }
-    let nums = parts.compactMap { $0 }
-    let total: Int
-    switch nums.count {
-    case 1: total = nums[0] * 60
-    case 2: total = nums[0] * 60 + nums[1]
-    case 3: total = nums[0] * 3600 + nums[1] * 60 + nums[2]
-    default: return nil
-    }
-    return total > 0 ? total : nil
+/// "5" -> "05", "" -> "00". Longer strings are returned unchanged.
+func padded(_ s: String) -> String {
+    s.count >= 2 ? s : String(repeating: "0", count: 2 - s.count) + s
+}
+
+/// Hours / minutes / seconds text fields -> total seconds. Empty or invalid text counts as 0.
+func hmsToSeconds(_ h: String, _ m: String, _ s: String) -> Int {
+    (Int(h) ?? 0) * 3600 + (Int(m) ?? 0) * 60 + (Int(s) ?? 0)
+}
+
+/// Keeps ASCII digits only and the last two of them ("005" -> "05").
+func sanitizeSegment(_ text: String) -> String {
+    let digits = text.filter { $0 >= "0" && $0 <= "9" }
+    return String(digits.suffix(2))
+}
+
+/// Called whenever a two-digit field changes. Works out what the user just typed (wherever the
+/// caret was) and shifts those digits in from the right, like a microwave keypad:
+///   "00" + 4 -> "04", then + 3 -> "43".   Deleting / replacing a selection is just sanitised.
+func nextSegmentValue(old: String, new: String) -> String {
+    if new.count <= old.count { return sanitizeSegment(new) }
+    let o = Array(old), n = Array(new)
+    var prefix = 0
+    while prefix < o.count && prefix < n.count && o[prefix] == n[prefix] { prefix += 1 }
+    var suffix = 0
+    while suffix < o.count - prefix && suffix < n.count - prefix
+            && o[o.count - 1 - suffix] == n[n.count - 1 - suffix] { suffix += 1 }
+    let inserted = String(n[prefix..<(n.count - suffix)])
+    return sanitizeSegment(sanitizeSegment(old) + sanitizeSegment(inserted))
 }
 
 // MARK: - Model
@@ -101,9 +118,6 @@ final class Heartbeat: ObservableObject {
 final class TimerStore: ObservableObject {
     @Published private(set) var items: [TimerItem] = []
     @Published private(set) var runtime: [UUID: Runtime] = [:]
-    // "add timer" form fields live here (instead of @State) so no SwiftUI macro plugin is needed
-    @Published var draftName = ""
-    @Published var draftLength = ""
 
     let heartbeat = Heartbeat()
 
@@ -198,33 +212,61 @@ final class TimerStore: ObservableObject {
         silenceIfNothingFinished()
     }
 
-    /// +1m / +5m buttons.
-    /// running -> extends the current run, paused -> extends what's left,
-    /// idle -> makes the saved timer itself longer, finished -> snooze (silence + run again).
+    /// +1m / +5m / -1m / -5m buttons (pass a negative number to subtract).
+    /// running -> changes the current run, paused -> changes what's left,
+    /// idle -> changes the saved timer length itself, finished -> "+" snoozes (silence + run again), "-" does nothing.
+    /// The result never drops below 1 second.
     func addTime(_ id: UUID, seconds: Int) {
         guard var r = runtime[id] else { return }
         let extra = TimeInterval(seconds)
         switch r.state {
         case .running:
-            r.endDate = (r.endDate ?? Date()).addingTimeInterval(extra)
+            let left = max(1, remaining(of: id) + extra)
+            r.endDate = Date().addingTimeInterval(left)
             runtime[id] = r
             updateTicker()   // end date moved -> re-aim the next wake-up
         case .paused:
-            r.remaining += extra
+            r.remaining = max(1, r.remaining + extra)
             runtime[id] = r
         case .idle:
             guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
-            items[idx].duration += seconds
+            items[idx].duration = max(1, items[idx].duration + seconds)
             r.remaining = TimeInterval(items[idx].duration)
             runtime[id] = r
             save()
         case .finished:
+            guard seconds > 0 else { return }
             r.remaining = extra
             r.endDate = Date().addingTimeInterval(extra)
             r.state = .running
             runtime[id] = r
             silenceIfNothingFinished()
             updateTicker()
+        }
+    }
+
+    /// Sets the time left to an exact value (the click-the-countdown editor).
+    /// running -> ends `seconds` from now, paused -> sets what's left,
+    /// idle -> changes the saved timer length itself, finished -> ignored (the UI doesn't offer it).
+    func setRemaining(_ id: UUID, seconds: Int) {
+        guard seconds > 0, var r = runtime[id] else { return }
+        let value = TimeInterval(seconds)
+        switch r.state {
+        case .running:
+            r.endDate = Date().addingTimeInterval(value)
+            runtime[id] = r
+            updateTicker()
+        case .paused:
+            r.remaining = value
+            runtime[id] = r
+        case .idle:
+            guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+            items[idx].duration = seconds
+            r.remaining = value
+            runtime[id] = r
+            save()
+        case .finished:
+            return
         }
     }
 
@@ -262,8 +304,8 @@ final class TimerStore: ObservableObject {
         if rem <= 0 {
             delay = 0.01
         } else {
-            delay = rem - rem.rounded(.down)      // time until the next integer second boundary
-            if delay < 0.05 { delay += 1 }
+            delay = rem - rem.rounded(.down)      // time until the next whole-second boundary
+            if delay == 0 { delay = 1 }            // exactly on a boundary -> wait for the next one
             delay += 0.01                          // land just past it so ceil() has flipped
         }
         // make sure any other timer ending sooner still fires its alarm on time
@@ -376,10 +418,89 @@ struct CountdownText: View {
     }
 }
 
+/// Three clickable two-digit fields:  HH : MM : SS.
+/// Click a field and type: digits shift in from the right ("00" -> "04" -> "43").
+/// Tab moves to the next field, Return calls `onCommit`.
+struct TimeEntry: View {
+    @Binding var h: String
+    @Binding var m: String
+    @Binding var s: String
+    var fontSize: CGFloat
+    var autofocus = false
+    var onCommit: () -> Void
+
+    private enum Field: Hashable { case h, m, s }
+    @FocusState private var focus: Field?
+
+    var body: some View {
+        HStack(spacing: 2) {
+            segment($h, .h)
+            colon
+            segment($m, .m)
+            colon
+            segment($s, .s)
+        }
+        .onChange(of: focus) { old, _ in
+            // leaving a field: "4" -> "04"
+            if let old = old {
+                switch old {
+                case .h: h = padded(h)
+                case .m: m = padded(m)
+                case .s: s = padded(s)
+                }
+            }
+        }
+        .onAppear {
+            if autofocus {
+                DispatchQueue.main.async { focus = .h }
+            }
+        }
+    }
+
+    private var colon: some View {
+        Text(":")
+            .font(.system(size: fontSize, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.secondary)
+    }
+
+    private func segment(_ text: Binding<String>, _ field: Field) -> some View {
+        TextField("00", text: text)
+            .textFieldStyle(.plain)
+            .font(.system(size: fontSize, weight: .semibold, design: .monospaced))
+            .multilineTextAlignment(.center)
+            .frame(width: fontSize * 1.5)
+            .padding(.vertical, 3)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.primary.opacity(focus == field ? 0.20 : 0.08))
+            )
+            .focused($focus, equals: field)
+            .onChange(of: text.wrappedValue) { old, new in
+                let next = nextSegmentValue(old: old, new: new)
+                if next != new { text.wrappedValue = next }
+            }
+            .onSubmit(onCommit)
+    }
+}
+
+/// Tiny observable box for the editor / add-row fields. Used instead of @State: with the
+/// newest SDKs @State is a macro whose plugin only ships with the full Xcode app, so it
+/// fails to compile with Command Line Tools alone. @StateObject has no such requirement.
+final class EntryModel: ObservableObject {
+    @Published var editing = false
+    @Published var name = ""
+    @Published var h = "00"
+    @Published var m = "00"
+    @Published var s = "00"
+}
+
 struct TimerRow: View {
     @ObservedObject var store: TimerStore
     let heartbeat: Heartbeat                    // passed down, NOT observed here
     let item: TimerItem
+
+    // editor state lives here, so typing redraws only this row
+    @StateObject private var ed = EntryModel()
 
     private var state: RunState { store.state(of: item.id) }
 
@@ -409,9 +530,11 @@ struct TimerRow: View {
         }
     }
 
+    private var editTotal: Int { hmsToSeconds(ed.h, ed.m, ed.s) }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Top: name + status on the left, big time on the right. Click to start/pause.
+            // Top: name + status on the left (click = start/pause), time on the right (click = edit).
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(item.name)
@@ -420,18 +543,76 @@ struct TimerRow: View {
                     Text(subtitle)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                Spacer(minLength: 8)
-                CountdownText(store: store, heartbeat: heartbeat, id: item.id, color: timeColor)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { store.toggle(item.id) }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture { store.toggle(item.id) }
 
-            // Bottom: +1m / +5m on the left, controls on the right.
+                timeArea
+            }
+
+            controls
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.primary.opacity(0.07))
+        )
+        .onChange(of: state) { _, new in
+            if new == .finished { ed.editing = false }   // timer ran out while editing
+        }
+    }
+
+    // MARK: Time area (countdown, or the editor)
+
+    @ViewBuilder
+    private var timeArea: some View {
+        if ed.editing && state != .finished {
+            HStack(spacing: 6) {
+                TimeEntry(h: $ed.h, m: $ed.m, s: $ed.s, fontSize: 24, autofocus: true, onCommit: commitEdit)
+                smallButton("checkmark", enabled: editTotal > 0) { commitEdit() }
+                smallButton("xmark", enabled: true) { ed.editing = false }
+            }
+            .onExitCommand { ed.editing = false }
+        } else {
+            CountdownText(store: store, heartbeat: heartbeat, id: item.id, color: timeColor)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    if state == .finished {
+                        store.toggle(item.id)   // same as before: silence + reset
+                    } else {
+                        beginEdit()
+                    }
+                }
+        }
+    }
+
+    private func beginEdit() {
+        let total = Int(store.remaining(of: item.id).rounded(.up))
+        ed.h = padded(String(min(total / 3600, 99)))
+        ed.m = padded(String((total % 3600) / 60))
+        ed.s = padded(String(total % 60))
+        ed.editing = true
+    }
+
+    private func commitEdit() {
+        let total = hmsToSeconds(ed.h, ed.m, ed.s)
+        guard total > 0 else { return }
+        store.setRemaining(item.id, seconds: total)
+        ed.editing = false
+    }
+
+    // MARK: Buttons
+
+    private var controls: some View {
+        HStack(spacing: 6) {
+            pill("\u{2212}5m", enabled: state != .finished) { store.addTime(item.id, seconds: -300) }
+            pill("\u{2212}1m", enabled: state != .finished) { store.addTime(item.id, seconds: -60) }
+            pill("+1m") { store.addTime(item.id, seconds: 60) }
+            pill("+5m") { store.addTime(item.id, seconds: 300) }
+            Spacer(minLength: 0)
             HStack(spacing: 8) {
-                pill("+ 1m") { store.addTime(item.id, seconds: 60) }
-                pill("+ 5m") { store.addTime(item.id, seconds: 300) }
-                Spacer(minLength: 0)
                 // Reset: stops the timer and puts it back to its full length (e.g. 59:58 -> 1:00:00)
                 circleButton("arrow.counterclockwise", tint: nil) { store.reset(item.id) }
                     .opacity(state == .idle ? 0.35 : 1)
@@ -440,23 +621,21 @@ struct TimerRow: View {
                 circleButton("xmark", tint: closePink) { store.remove(item.id) }
             }
         }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color.primary.opacity(0.07))
-        )
     }
 
-    private func pill(_ title: String, action: @escaping () -> Void) -> some View {
+    private func pill(_ title: String, enabled: Bool = true, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                .padding(.horizontal, 14)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+                .padding(.horizontal, 10)
                 .padding(.vertical, 8)
                 .background(Capsule().fill(Color.primary.opacity(0.10)))
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.35)
     }
 
     private func circleButton(_ systemName: String, tint: Color?, action: @escaping () -> Void) -> some View {
@@ -465,11 +644,65 @@ struct TimerRow: View {
             Image(systemName: systemName)
                 .font(.system(size: 14, weight: .bold))
                 .foregroundStyle(base)
-                .frame(width: 36, height: 36)
+                .frame(width: 34, height: 34)
                 .background(Circle().fill(base.opacity(tint == nil ? 0.10 : 0.18)))
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
+    }
+
+    private func smallButton(_ systemName: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(Color.primary)
+                .frame(width: 26, height: 26)
+                .background(Circle().fill(Color.primary.opacity(0.12)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.35)
+    }
+}
+
+/// "New timer" row: name + HH:MM:SS fields + add button. Owns its own EntryModel.
+struct AddTimerRow: View {
+    let store: TimerStore                       // plain reference: not observed on purpose
+
+    @StateObject private var ed = EntryModel()
+
+    private var total: Int { hmsToSeconds(ed.h, ed.m, ed.s) }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            TextField("New timer name", text: $ed.name)
+                .textFieldStyle(.plain)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Capsule().fill(Color.primary.opacity(0.08)))
+                .onSubmit(addTimer)
+            TimeEntry(h: $ed.h, m: $ed.m, s: $ed.s, fontSize: 18, onCommit: addTimer)
+            Button(action: addTimer) {
+                Image(systemName: "plus")
+                    .font(.system(size: 14, weight: .bold))
+                    .frame(width: 36, height: 36)
+                    .background(Circle().fill(Color.primary.opacity(0.10)))
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(total == 0)
+            .opacity(total == 0 ? 0.35 : 1)
+        }
+    }
+
+    private func addTimer() {
+        guard total > 0 else { return }
+        store.add(name: ed.name.trimmingCharacters(in: .whitespaces), seconds: total)
+        ed.name = ""
+        ed.h = "00"
+        ed.m = "00"
+        ed.s = "00"
     }
 }
 
@@ -505,30 +738,7 @@ struct ContentView: View {
                 TimerRow(store: store, heartbeat: store.heartbeat, item: item)
             }
 
-            // Add a new timer
-            HStack(spacing: 8) {
-                TextField("New timer name", text: $store.draftName)
-                    .textFieldStyle(.plain)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Capsule().fill(Color.primary.opacity(0.08)))
-                TextField("mm or mm:ss", text: $store.draftLength)
-                    .textFieldStyle(.plain)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Capsule().fill(Color.primary.opacity(0.08)))
-                    .frame(width: 104)
-                    .onSubmit(addTimer)
-                Button(action: addTimer) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 14, weight: .bold))
-                        .frame(width: 36, height: 36)
-                        .background(Circle().fill(Color.primary.opacity(0.10)))
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .disabled(parseDuration(store.draftLength) == nil)
-            }
+            AddTimerRow(store: store)
 
             HStack {
                 Spacer()
@@ -541,14 +751,7 @@ struct ContentView: View {
             .padding(.horizontal, 4)
         }
         .padding(14)
-        .frame(width: 360)
-    }
-
-    private func addTimer() {
-        guard let seconds = parseDuration(store.draftLength) else { return }
-        store.add(name: store.draftName.trimmingCharacters(in: .whitespaces), seconds: seconds)
-        store.draftName = ""
-        store.draftLength = ""
+        .frame(width: panelWidth)
     }
 }
 
