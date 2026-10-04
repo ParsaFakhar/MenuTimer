@@ -7,6 +7,11 @@
 //  - One one-shot timer, aimed just past the next whole-second boundary (1 wake-up/second,
 //    nothing scheduled when no timer is running).
 //
+// NEW IN 1.2:
+//  - Drag the ":::" grip on the left of a timer to reorder the list. Order is saved.
+//    Zero cost while idle: no timers, no polling, no extra publishes. The store only changes
+//    when the dragged row crosses another row.
+//
 // NEW IN 1.1:
 //  - New timers: click the 00 : 00 : 00 fields (hours / minutes / seconds) and type.
 //  - -5m / -1m buttons next to +1m / +5m (never drops below 00:00:01).
@@ -17,6 +22,7 @@
 
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 // MARK: - Settings you may want to tweak
 
@@ -277,6 +283,23 @@ final class TimerStore: ObservableObject {
         save()
     }
 
+    // MARK: Reordering (drag & drop)
+
+    /// Which timer is being dragged right now. Deliberately NOT @Published: nothing needs to
+    /// redraw when it changes.
+    var draggingID: UUID?
+
+    /// Live reorder: while the grip is dragged over another row, the dragged timer takes that row's place.
+    func moveDragged(over targetID: UUID) {
+        guard let dragged = draggingID, dragged != targetID,
+              let from = items.firstIndex(where: { $0.id == dragged }),
+              let to = items.firstIndex(where: { $0.id == targetID }) else { return }
+        withAnimation(.easeInOut(duration: 0.15)) {
+            items.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
+        }
+        save()   // a few tiny writes per drag, only when a row boundary is crossed
+    }
+
     func remove(_ id: UUID) {
         items.removeAll { $0.id == id }
         runtime[id] = nil
@@ -494,6 +517,67 @@ final class EntryModel: ObservableObject {
     @Published var s = "00"
 }
 
+/// The ":::" drag handle (2 columns x 3 rows of dots). Static, never redraws on its own.
+struct GripHandle: View {
+    var body: some View {
+        VStack(spacing: 3) {
+            ForEach(0..<3, id: \.self) { _ in
+                HStack(spacing: 3) {
+                    Circle().frame(width: 3.5, height: 3.5)
+                    Circle().frame(width: 3.5, height: 3.5)
+                }
+            }
+        }
+        .foregroundStyle(.tertiary)
+        .frame(width: 18, height: 38)          // comfortable grab area
+        .contentShape(Rectangle())
+        .help("Drag to reorder")
+    }
+}
+
+/// Small look-alike shown under the cursor while dragging (cheap: just two texts).
+struct DragPreview: View {
+    let name: String
+    let time: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(name)
+                .font(.system(size: 16, weight: .bold, design: .rounded))
+                .lineLimit(1)
+            Text(time)
+                .font(.system(size: 16, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor))
+        )
+    }
+}
+
+/// Drop target for reordering. `target == nil` is the catch-all on the whole panel, so a drop that
+/// lands between rows is still accepted (no snap-back animation).
+struct ReorderDelegate: DropDelegate {
+    let target: UUID?
+    let store: TimerStore
+
+    func validateDrop(info: DropInfo) -> Bool { store.draggingID != nil }
+
+    func dropEntered(info: DropInfo) {
+        if let target = target { store.moveDragged(over: target) }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+
+    func performDrop(info: DropInfo) -> Bool {
+        store.draggingID = nil
+        return true
+    }
+}
+
 struct TimerRow: View {
     @ObservedObject var store: TimerStore
     let heartbeat: Heartbeat                    // passed down, NOT observed here
@@ -535,7 +619,15 @@ struct TimerRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             // Top: name + status on the left (click = start/pause), time on the right (click = edit).
-            HStack(alignment: .top) {
+            HStack(alignment: .top, spacing: 6) {
+                GripHandle()
+                    .onDrag({
+                        store.draggingID = item.id
+                        return NSItemProvider(object: item.id.uuidString as NSString)
+                    }, preview: {
+                        DragPreview(name: item.name, time: formatTime(store.remaining(of: item.id)))
+                    })
+
                 VStack(alignment: .leading, spacing: 2) {
                     Text(item.name)
                         .font(.system(size: 18, weight: .bold, design: .rounded))
@@ -562,6 +654,7 @@ struct TimerRow: View {
         .onChange(of: state) { _, new in
             if new == .finished { ed.editing = false }   // timer ran out while editing
         }
+        .onDrop(of: [.text], delegate: ReorderDelegate(target: item.id, store: store))
     }
 
     // MARK: Time area (countdown, or the editor)
@@ -752,6 +845,7 @@ struct ContentView: View {
         }
         .padding(14)
         .frame(width: panelWidth)
+        .onDrop(of: [.text], delegate: ReorderDelegate(target: nil, store: store))
     }
 }
 
